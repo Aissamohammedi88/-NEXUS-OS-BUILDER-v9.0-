@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NEXUS OS BUILDER v10 - version refactorisée.
+Construction 100 % locale d'un rootfs minimal et archivage en .tar.xz.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import tarfile
+import tempfile
+import threading
+import traceback
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, List, Optional
+
+VERSION = "10.0.0"
+HOST = "127.0.0.1"
+PORT = 9972
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION ET DOSSIERS DE TRAVAIL
+# ═══════════════════════════════════════════════════════════════════
+
+def find_base() -> Path:
+    """Retourne le premier dossier de travail inscriptible."""
+    import os
+
+    candidates = [
+        os.getenv("NEXUS_DIR"),
+        os.path.expanduser("~/nexus_build"),
+        os.path.join(tempfile.gettempdir(), "nexus_build"),
+        os.path.expanduser("~/Documents/nexus_build"),
+        os.path.join(os.getcwd(), "nexus_build"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate)
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return path
+        except OSError:
+            continue
+    raise RuntimeError("Aucun dossier inscriptible trouvé")
+
+
+BASE = find_base()
+LOGS = BASE / "logs"
+EXPORTS = BASE / "exports"
+BUILDS = BASE / "builds"
+for _folder in (LOGS, EXPORTS, BUILDS):
+    _folder.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOGS / "builder.log", encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("NEXUS")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODÈLE DE PROJET
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class Project:
+    id: str
+    name: str
+    distro: str
+    prompt: str
+    status: str = "PENDING"
+    progress: int = 0
+    step: str = ""
+    logs: List[str] = field(default_factory=list)
+    archive: Optional[str] = None
+    size_kb: int = 0
+    files_count: int = 0
+    error: Optional[str] = None
+
+    def add_log(self, message: str) -> None:
+        """Ajoute une entrée horodatée au journal du projet."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logs.append(f"[{timestamp}] {message}")
+        log.info("[%s] %s", self.id, message)
+
+    def set_step(self, progress: int, step: str) -> None:
+        """Met à jour la progression et le libellé de l'étape courante."""
+        self.progress = progress
+        self.step = step
+
+
+# ═══════════════════════════════════════════════════════════════════
+# UTILITAIRES DE FICHIERS
+# ═══════════════════════════════════════════════════════════════════
+
+def write_file(base: Path, relative: str, content: str, mode: Optional[int] = None) -> Path:
+    """Écrit un fichier dans le rootfs, crée les dossiers parents et applique un mode."""
+    target = base / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8", newline="\n")
+    if mode is not None:
+        target.chmod(mode)
+    return target
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CONTENU GÉNÉRÉ (gabarits)
+# ═══════════════════════════════════════════════════════════════════
+
+ROOT_DIRS = [
+    "bin", "sbin", "etc", "proc", "sys", "dev", "tmp", "run",
+    "root", "home", "home/nexus", "var", "var/log", "usr",
+    "usr/bin", "usr/sbin", "usr/lib", "opt", "srv", "mnt", "media",
+]
+
+INIT_TEMPLATE = """#!/bin/sh
+# NEXUS OS - {name}
+# Built: {built}
+# Distro: {distro}
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export PS1='nexus@os:\\w# '
+
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+
+clear 2>/dev/null || true
+
+echo ""
+echo "+------------------------------------------------------------+"
+echo "| NEXUS OS v{version}"
+echo "| {name}"
+echo "| Distro: {distro}"
+echo "+------------------------------------------------------------+"
+echo ""
+echo " Uptime : $(cut -d' ' -f1 /proc/uptime 2>/dev/null)s"
+echo ""
+
+exec /bin/sh
+"""
+
+SHELL_TEMPLATE = """#!/bin/sh
+# NEXUS minimal shell
+while true; do
+    printf "nexus@os:# "
+    read cmd
+    case "$cmd" in
+        exit) exit 0 ;;
+        help) echo "Commandes: exit, help, info, ls, echo" ;;
+        info) cat /etc/nexus-release 2>/dev/null ;;
+        ls) echo "bin etc home proc root sys tmp usr var" ;;
+        *) echo "nexus: commande non disponible en mode minimal" ;;
+    esac
+done
+"""
+
+NEXUS_INFO_TEMPLATE = """#!/bin/sh
+echo "========================================"
+echo " NEXUS OS v{version}"
+echo " Name: {name}"
+echo " Distro: {distro}"
+echo " Built: {built_short}"
+echo "========================================"
+"""
+
+README_TEMPLATE = """NEXUS OS v{version}
+Name: {name}
+Distro: {distro}
+Prompt: {prompt}
+
+Boot avec QEMU:
+qemu-system-x86_64 -kernel vmlinuz -initrd initramfs.cpio.gz -append "console=tty0"
+
+Contenu rootfs:
+/init          Script d'init
+/bin/sh        Shell minimal
+/bin/nexus-info Info système
+/etc/          Config système
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ÉTAPES DU BUILD
+# ═══════════════════════════════════════════════════════════════════
+
+StepFunc = Callable[[Project, Path], None]
+
+
+def step_structure(project: Project, rootfs: Path) -> None:
+    for folder in ROOT_DIRS:
+        (rootfs / folder).mkdir(parents=True, exist_ok=True)
+
+
+def step_init(project: Project, rootfs: Path) -> None:
+    content = INIT_TEMPLATE.format(
+        name=project.name,
+        built=datetime.now().isoformat(),
+        distro=project.distro,
+        version=VERSION,
+    )
+    write_file(rootfs, "init", content, mode=0o755)
+
+
+def step_shell(project: Project, rootfs: Path) -> None:
+    write_file(rootfs, "bin/sh", SHELL_TEMPLATE, mode=0o755)
+
+
+def step_system_files(project: Project, rootfs: Path) -> None:
+    now = datetime.now().isoformat()
+    files = {
+        "etc/passwd": "root:x:0:0:root:/root:/bin/sh\n"
+                      "nexus:x:1000:1000:Nexus:/home/nexus:/bin/sh\n"
+                      "nobody:x:65534:65534:nobody:/:/bin/false\n",
+        "etc/group": "root:x:0:\nnexus:x:1000:\nwheel:x:10:nexus\nnobody:x:65534:\n",
+        "etc/shadow": "root:*:19000:0:99999:7:::\nnexus:*:19000:0:99999:7:::\n",
+        "etc/hostname": f"nexus-{project.id}\n",
+        "etc/hosts": "127.0.0.1\tlocalhost\n127.0.1.1\tnexus\n",
+        "etc/resolv.conf": "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+        "etc/fstab": "proc /proc proc defaults 0 0\n"
+                     "sysfs /sys sysfs defaults 0 0\n"
+                     "devtmpfs /dev devtmpfs defaults 0 0\n",
+        "etc/issue": f"NEXUS OS v{VERSION} - {project.name}\n",
+        "etc/profile": "export PATH=/bin:/sbin:/usr/bin:/usr/sbin\nexport HOME=/root\n",
+        "etc/nexus-release": (
+            f"NEXUS OS v{VERSION}\nName: {project.name}\n"
+            f"Distro: {project.distro}\nBuilt: {now}\n"
+        ),
+    }
+    for relative, content in files.items():
+        mode = 0o600 if "shadow" in relative else None
+        write_file(rootfs, relative, content, mode=mode)
+
+
+def step_tools(project: Project, rootfs: Path) -> None:
+    content = NEXUS_INFO_TEMPLATE.format(
+        version=VERSION,
+        name=project.name,
+        distro=project.distro,
+        built_short=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+    write_file(rootfs, "bin/nexus-info", content, mode=0o755)
+
+
+def step_readme(project: Project, rootfs: Path) -> None:
+    content = README_TEMPLATE.format(
+        version=VERSION,
+        name=project.name,
+        distro=project.distro,
+        prompt=project.prompt,
+    )
+    write_file(rootfs, "README.txt", content)
+
+
+def step_archive(project: Project, rootfs: Path) -> None:
+    archive_path = EXPORTS / f"{project.name}_{project.id}.tar.xz"
+    with tarfile.open(archive_path, "w:xz", preset=6) as tar:
+        tar.add(rootfs, arcname="rootfs")
+        tar.add(rootfs / "README.txt", arcname="README.txt")
+    project.archive = str(archive_path)
+    project.size_kb = archive_path.stat().st_size // 1024
+
+
+def step_stats(project: Project, rootfs: Path) -> None:
+    project.files_count = sum(1 for item in rootfs.rglob("*") if item.is_file())
+    project.add_log(f"Archive: {project.size_kb} KB, {project.files_count} fichiers")
+
+
+# Étapes déclarées : (progression, libellé, fonction, message de journal)
+BUILD_STEPS: List[tuple] = [
+    (10, "Structure rootfs", step_structure, "Création de l'arborescence"),
+    (20, "/init", step_init, "Création de /init"),
+    (30, "Shell minimal", step_shell, "Création de /bin/sh"),
+    (40, "Fichiers système", step_system_files, "Écriture des fichiers /etc"),
+    (50, "Outils NEXUS", step_tools, "Création de nexus-info"),
+    (60, "README", step_readme, "Écriture du README"),
+    (80, "Archive", step_archive, "Création de l'archive .tar.xz"),
+    (95, "Stats", step_stats, "Calcul des statistiques"),
+]
+
+
+def build_project(project: Project) -> None:
+    """Construit le rootfs puis l'archive. Ne lève jamais d'exception."""
+    try:
+        project.status = "BUILDING"
+        project.add_log(f"Démarrage du build : {project.name}")
+        project.add_log(f"Distro : {project.distro}")
+        project.add_log(f"Prompt : {project.prompt[:60]}")
+
+        rootfs = BUILDS / project.id / "rootfs"
+        rootfs.mkdir(parents=True, exist_ok=True)
+
+        for progress, label, func, message in BUILD_STEPS:
+            project.set_step(progress, label)
+            project.add_log(message)
+            func(project, rootfs)
+
+        project.set_step(100, "Terminé")
+        project.status = "COMPLETED"
+        project.add_log("Build terminé avec succès")
+        project.add_log(f"Téléchargement : /download/{project.id}/archive")
+
+    except Exception as exc:  # noqa: BLE001 - on journalise tout échec de build
+        project.status = "FAILED"
+        project.error = str(exc)
+        project.add_log(f"ERREUR : {exc}")
+        log.debug(traceback.format_exc())
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FACTORY
+# ═══════════════════════════════════════════════════════════════════
+
+class Factory:
+    """Gère la création et le suivi des projets de build."""
+
+    def __init__(self) -> None:
+        self.projects: Dict[str, Project] = {}
+        self.lock = threading.RLock()
+
+    def create(self, name: str, distro: str, prompt: str) -> Project:
+        project_id = str(uuid.uuid4())[:8]
+        project = Project(project_id, name, distro, prompt)
+        with self.lock:
+            self.projects[project_id] = project
+        threading.Thread(target=build_project, args=(project,), daemon=True).start()
+        return project
+
+    def get(self, project_id: str) -> Optional[Project]:
+        with self.lock:
+            return self.projects.get(project_id)
+
+    def all(self) -> List[dict]:
+        with self.lock:
+            return [asdict(p) for p in self.projects.values()]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# POINT D'ENTRÉE (serveur HTTP et routes non reçus : à compléter)
+# ═══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    factory = Factory()
+    log.info("NEXUS OS Builder v%s prêt (factory initialisée, serveur HTTP non inclus)", VERSION)
