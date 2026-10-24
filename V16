@@ -1,0 +1,56 @@
+// Nexus OS Builder - Client Bridge Module v10.5
+// Gestion des requetes asynchrones et suivi d'etat en temps reel
+
+export interface BuildProjectPayload {
+    name: string;
+    distro: string;
+    prompt: string;
+}
+
+export interface BuildStatusResponse {
+    id: string;
+    status: string;
+    progress: number;
+    current_step: string;
+    artifacts: string[];
+    logs_count: number;
+}
+
+export class NexusBuilderClient {
+    private baseUrl: string;
+
+    constructor(baseUrl: string = "http://127.0.0.1:9972") {
+        this.baseUrl = baseUrl;
+    }
+
+    public async createProject(payload: BuildProjectPayload): Promise<string> {
+        const response = await fetch(`${this.baseUrl}/api/v1/projects`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Erreur lors de la creation du projet : ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        return data.id;
+    }
+
+    public async getProjectStatus(projectId: string): Promise<BuildStatusResponse> {
+        const response = await fetch(`${this.baseUrl}/status/${projectId}`);
+        
+        if (!response.ok) {
+            throw new Error(`Impossible de recuperer le statut : ${response.statusText}`);
+        }
+
+        return await response.json();
+    }
+
+    public getDownloadUrl(projectId: string): string {
+        return `${this.baseUrl}/download/${projectId}/archive`;
+    }
+}
