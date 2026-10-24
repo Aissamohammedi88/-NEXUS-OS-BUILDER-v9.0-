@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# -*- coding: utf-8 -*-
+# NEXUS OS BUILDER - Script d'orchestration global
+
+set -euo pipefail
+
+VERSION="10.5.0"
+WORKING_DIR="$HOME/nexus_build"
+
+echo "=========================================="
+echo " NEXUS OS BUILDER - INITIALISATION v$VERSION"
+echo "=========================================="
+
+# Creation de l'arborescence de travail
+echo "[*] Configuration des repertoires de travail..."
+mkdir -p "$WORKING_DIR"/{builds,exports,logs,src}
+
+# Verification des dependances systeme
+echo "[*] Verification des outils requis..."
+for tool in python3 rustc g++ go tar; do
+    if ! command -v "$tool" &> /dev/null; then
+        echo "[ERREUR] L'outil requis '$tool' est introuvable."
+        exit 1
+    fi
+done
+
+echo "[+] Tous les composants de base sont verifies."
+echo "[+] L'environnement est pret pour l'etape finale d'assemblage."
