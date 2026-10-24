@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+NEXUS OS BUILDER v10 - VERSION COMPLETE ET FONCTIONNELLE
+Système de génération d'environnements systeme minimalistes.
+"""
+
+import os
+import sys
+import json
+import time
+import uuid
+import shutil
+import tarfile
+import threading
+import tempfile
+import traceback
+import argparse
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, List
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from dataclasses import dataclass, asdict
+
+VERSION = "10.0.0"
+HOST = "127.0.0.1"
+PORT = 9972
+
+# Stockage global des projets en mémoire
+PROJECTS: Dict[str, "Project"] = {}
+PROJECTS_LOCK = threading.Lock()
+
+def find_base() -> Path:
+    """Trouve un dossier de base inscriptible avec plusieurs replis."""
+    candidates = [
+        os.getenv("NEXUS_DIR"),
+        os.path.expanduser("~/nexus_build"),
+        os.path.join(tempfile.gettempdir(), "nexus_build"),
+        os.path.expanduser("~/Documents/nexus_build"),
+        os.path.join(os.getcwd(), "nexus_build")
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            p = Path(c)
+            p.mkdir(parents=True, exist_ok=True)
+            test_file = p / ".t"
+            test_file.write_text("x")
+            test_file.unlink()
+            return p
+        except Exception:
+            continue
+    raise RuntimeError("Aucun dossier inscriptible trouvé pour le stockage")
+
+BASE = find_base()
+LOGS = BASE / "logs"
+LOGS.mkdir(exist_ok=True)
+EXPORTS = BASE / "exports"
+EXPORTS.mkdir(exist_ok=True)
+BUILDS = BASE / "builds"
+BUILDS.mkdir(exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[
+        logging.FileHandler(LOGS / "builder.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+log = logging.getLogger("NEXUS")
+
+
+@dataclass
+class Project:
+    id: str
+    name: str
+    distro: str
+    prompt: str
+    status: str = "PENDING"
+    progress: int = 0
+    step: str = ""
+    logs: list = None
+    archive: Optional[str] = None
+    size_kb: int = 0
+    files_count: int = 0
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.logs is None:
+            self.logs = []
+
+    def add_log(self, msg: str):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.logs.append(f"[{ts}] {msg}")
+        log.info(f"[{self.id}] {msg}")
+
+
+def build_project(p: Project):
+    """Construit l'environnement de manière totalement locale."""
+    try:
+        p.status = "BUILDING"
+        p.add_log(f"Demarrage du build pour {p.name}")
+        p.add_log(f"Distribution cible : {p.distro}")
+
+        build_dir = BUILDS / p.id
+        build_dir.mkdir(parents=True, exist_ok=True)
+        rootfs = build_dir / "rootfs"
+        rootfs.mkdir(exist_ok=True)
+
+        p.progress = 10
+        p.step = "Structure rootfs"
+        p.add_log("Creation de l'arborescence des dossiers")
+
+        dirs = [
+            "bin", "sbin", "etc", "proc", "sys", "dev", "tmp", "run",
+            "root", "home", "home/nexus", "var", "var/log", "usr",
+            "usr/bin", "usr/sbin", "usr/lib", "opt", "srv", "mnt", "media"
+        ]
+        for d in dirs:
+            (rootfs / d).mkdir(parents=True, exist_ok=True)
+
+        p.progress = 20
+        p.step = "Fichier /init"
+        p.add_log("Generation du script d'initialisation")
+
+        init_content = f"""#!/bin/sh
+# NEXUS OS - {p.name}
+# Construit le : {datetime.now().isoformat()}
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export PS1='nexus@os:\\w# '
+
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp 2>/dev/null
+
+clear 2>/dev/null || true
+echo "NEXUS OS v{VERSION} - {p.name}"
+exec /bin/sh
+"""
+        init_path = rootfs / "init"
+        init_path.write_text(init_content)
+        os.chmod(init_path, 0o755)
+
+        p.progress = 30
+        p.step = "Shell minimal"
+        p.add_log("Creation du shell integre")
+
+        sh_content = """#!/bin/sh
+while true; do
+printf "nexus@os:# "
+read cmd
+case "$cmd" in
+exit) exit 0 ;;
+help) echo "Commandes disponibles : exit, help, info" ;;
+info) echo "NEXUS OS Runtime Actif" ;;
+*) echo "Commande non reconnue" ;;
+esac
+done
+"""
+        sh_path = rootfs / "bin/sh"
+        sh_path.write_text(sh_content)
+        os.chmod(sh_path, 0o755)
+
+        p.progress = 50
+        p.step = "Fichiers de configuration"
+        p.add_log("Configuration du repertoire /etc")
+
+        system_files = {
+            "etc/passwd": "root:x:0:0:root:/root:/bin/sh\nnexus:x:1000:1000:Nexus:/home/nexus:/bin/sh\n",
+            "etc/group": "root:x:0:\nnexus:x:1000:\n",
+            "etc/hostname": f"nexus-{p.id}\n",
+            "etc/resolv.conf": "nameserver 1.1.1.1\n",
+        }
+        for rel_path, content in system_files.items():
+            fp = rootfs / rel_path
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_text(content)
+
+        p.progress = 80
+        p.step = "Compression de l'archive"
+        p.add_log("Generation de l'archive tar.xz")
+
+        archive_name = f"{p.name}_{p.id}.tar.xz"
+        archive_path = EXPORTS / archive_name
+
+        with tarfile.open(archive_path, "w:xz", preset=6) as tar:
+            tar.add(rootfs, arcname="rootfs")
+
+        p.progress = 95
+        p.step = "Calcul des metadonnees"
+        p.size_kb = archive_path.stat().st_size // 1024
+        p.files_count = sum(1 for _ in rootfs.rglob("*") if _.is_file())
+        p.archive = str(archive_path)
+
+        p.progress = 100
+        p.status = "COMPLETED"
+        p.step = "Termine"
+        p.add_log("Build termine avec succes")
+
+    except Exception as e:
+        p.status = "FAILED"
+        p.error = str(e)
+        p.add_log(f"Erreur critique : {e}")
+        p.add_log(traceback.format_exc()[:300])
+
+
+class NexusHandler(BaseHTTPRequestHandler):
+    """Gestionnaire de requêtes HTTP pour l'API du builder."""
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            html = f"<h1>NEXUS OS Builder v{VERSION}</h1><p>API Operationnelle.</p>"
+            self.wfile.write(html.encode("utf-8"))
+
+        elif path.startswith("/status/"):
+            pid = path.split("/")[-1]
+            with PROJECTS_LOCK:
+                proj = PROJECTS.get(pid)
+            if not proj:
+                self.send_error(404, "Projet non trouve")
+                return
+            self.send_json(asdict(proj))
+
+        elif path.startswith("/download/"):
+            pid = path.split("/")[-1]
+            with PROJECTS_LOCK:
+                proj = PROJECTS.get(pid)
+            if not proj or not proj.archive or not Path(proj.archive).exists():
+                self.send_error(404, "Archive non disponible")
+                return
+            
+            archive_path = Path(proj.archive)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-xz")
+            self.send_header("Content-Disposition", f"attachment; filename={archive_path.name}")
+            self.send_header("Content-Length", str(archive_path.stat().st_size))
+            self.end_headers()
+            with open(archive_path, "rb") as f:
+                shutil.copyfileobj(f, self.wfile)
+        else:
+            self.send_error(404, "Route inconnue")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/build":
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except Exception:
+                self.send_error(400, "JSON invalide")
+                return
+
+            name = data.get("name", "nexus-os")
+            distro = data.get("distro", "alpine")
+            prompt = data.get("prompt", "default build")
+
+            pid = uuid.uuid4().hex[:8] 2
+3 ·
+Alpha Waves Ten Deep
+1 
+            proj = Project(id=pid, name=name, distro=distro, prompt=prompt)
+
+            with PROJECTS_LOCK:
+                PROJECTS[pid] = proj
+
+            t = threading.Thread(target=build_project, args=(proj,))
+            t.daemon = True
+            t.start()
+
+            self.send_json({"id": pid, "status": "STARTED"})
+        else:
+            self.send_error(404, "Route inconnue")
+
+    def send_json(self, data: dict):
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(
